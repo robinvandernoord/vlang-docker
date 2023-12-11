@@ -1,18 +1,18 @@
 FROM alpine:latest
 
+ARG V_VERSION="master"
+
+WORKDIR /tmp/v
+
+
 RUN apk update && \
-    apk add --no-cache git
+    apk add --no-cache git make gcc libc-dev libatomic
 
 RUN git clone https://github.com/vlang/v.git /tmp/v
 
 
-RUN apk update && \
-    apk add --no-cache make gcc libc-dev libatomic
-
-WORKDIR /tmp/v
-
 # checkout latest tag for stability:
-RUN git checkout $(git describe --tags `git rev-list --tags --max-count=1`)
+RUN git checkout ${V_VERSION}
 
 RUN make
 

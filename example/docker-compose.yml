@@ -1,0 +1,6 @@
+services:
+  vlang:
+    build: .
+
+    volumes:
+      - ./src:/src

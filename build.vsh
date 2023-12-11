@@ -62,8 +62,8 @@ fn build_tag(version string) string {
 fn docker_build(version string, latest bool) !bool {
 	mut args := ['docker build .']
 
-	args << '-t ${build_tag(version)}'
 	args << '--build-arg="V_VERSION=${version}"'
+	args << '-t ${build_tag(version)}'
 
 	// if latest
 	if latest {
@@ -211,6 +211,16 @@ fn check_existing_build(version string) bool {
 	return data.results.filter(it.name == version).len > 0
 }
 
+fn build_and_push(version string, is_latest bool) {
+	docker_build(version, is_latest) or { panic('Docker build failed! ${err}') }
+
+	println('Build done!')
+
+	docker_push(version, is_latest) or { panic(err) }
+
+	println('All done building!')
+}
+
 fn build_version(version string, is_latest bool) int {
 	tag := '${version}-${get_arch()}'
 
@@ -223,21 +233,14 @@ fn build_version(version string, is_latest bool) int {
 		}
 	}
 
-	if check_existing_build(tag) && !is_latest {
+	if check_existing_build(tag) {
 		eprintln('${tag} already exists!')
 
 		return 0
 	}
 
 	println('Starting build on ${tag}')
-
-	docker_build(version, is_latest) or { panic('Docker build failed! ${err}') }
-
-	println('Build done!')
-
-	docker_push(version, is_latest) or { panic(err) }
-
-	println('All done building!')
+	build_and_push(version, is_latest)
 	return 0
 }
 

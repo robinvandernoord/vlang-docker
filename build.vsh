@@ -13,6 +13,8 @@ const docker_repo = 'robinvandernoord/vlang'
 
 const docker_releases_url = 'https://hub.docker.com/v2/repositories/${docker_repo}/tags/?page_size=25&page=1&ordering=last_updated'
 
+const default_arches = ['aarch64', 'x86_64']
+
 fn get_arch() string {
 	return os.uname().machine
 }
@@ -94,7 +96,7 @@ struct ReleaseInfo {
 	// ...
 }
 
-fn get_latest_release() string {
+fn get_latest_gh_release() string {
 	resp := http.get(github_releases_url + '/latest') or { panic(err) }
 
 	data := json.decode(ReleaseInfo, resp.body) or { panic(err) }
@@ -102,12 +104,17 @@ fn get_latest_release() string {
 	return data.tag_name
 }
 
-fn get_latest_releases(amount int) []string {
+fn get_latest_gh_releases(amount int) []string {
 	resp := http.get('${github_releases_url}?per_page=${amount}') or { panic(err) }
 
 	data := json.decode([]ReleaseInfo, resp.body) or { panic(err) }
 
 	return data.map(it.tag_name)
+}
+
+enum DockerReleaseType {
+	manifest
+	container
 }
 
 struct DockerRelease {
@@ -116,6 +123,12 @@ struct DockerRelease {
 		architecture string
 		variant      string
 	}
+
+	media_type string
+}
+
+fn (self &DockerRelease) get_type() DockerReleaseType {
+	return if self.media_type.contains('distribution.manifest') { .manifest } else { .container }
 }
 
 struct DockerInfo {
@@ -123,10 +136,77 @@ struct DockerInfo {
 	results []DockerRelease
 }
 
-fn check_existing_build(version string) bool {
-	resp := http.get(docker_releases_url) or { panic(err) }
+fn get_docker_releases() !DockerInfo {
+	resp := http.get(docker_releases_url)!
 
-	data := json.decode(DockerInfo, resp.body) or { panic(err) }
+	return json.decode(DockerInfo, resp.body)!
+}
+
+fn find_missing_manifests() ([]string, []string) {
+	data := get_docker_releases() or { panic(err) }
+
+	releases := (arrays.group_by(data.results, fn (it DockerRelease) DockerReleaseType {
+		return it.get_type()
+	}))
+
+	manifest_names := releases[.manifest].map(it.name)
+
+	mut missing := []string{}
+	mut arches := []string{}
+
+	for release in releases[.container] {
+		name := release.name.split('-')[0]
+		arch := release.name.split('-')[1]
+
+		if name !in manifest_names && name !in missing {
+			missing << name
+		}
+
+		if arch !in arches {
+			arches << arch
+		}
+	}
+
+	return missing, arches
+}
+
+fn create_manifest(version string, arches []string) bool {
+	if arches.len < 2 {
+		eprintln('Not enough releases to craft manifest for ${version}!')
+		return false
+	}
+
+	manifest_name := '${docker_repo}:${version}'
+
+	bash('docker manifest rm', manifest_name) or {}
+
+	mut args := ['docker manifest create', manifest_name]
+
+	for arch in arches {
+		args << '${docker_repo}:${version}-${arch}'
+	}
+
+	println('Creating ${version} for ${arches}')
+
+	bash(...args) or {
+		eprintln('Creating manifest ${version} failed: ${err}')
+		return false
+	}
+
+	bash('docker manifest push', manifest_name) or {
+		eprintln('Pushing manifest ${version} failed: ${err}')
+	}
+
+	return true
+}
+
+fn create_missing_manifests() bool {
+	manifests, arches := find_missing_manifests()
+	return manifests.map(create_manifest(it, arches)).all(it == true)
+}
+
+fn check_existing_build(version string) bool {
+	data := get_docker_releases() or { panic(err) }
 
 	return data.results.filter(it.name == version).len > 0
 }
@@ -134,8 +214,18 @@ fn check_existing_build(version string) bool {
 fn build_version(version string, is_latest bool) int {
 	tag := '${version}-${get_arch()}'
 
-	if check_existing_build(tag) {
+	defer {
+		// try to create manifests even if it already exists:
+		create_manifest(version, default_arches)
+
+		if is_latest {
+			create_manifest('latest', default_arches)
+		}
+	}
+
+	if check_existing_build(tag) && !is_latest {
 		eprintln('${tag} already exists!')
+
 		return 0
 	}
 
@@ -147,12 +237,12 @@ fn build_version(version string, is_latest bool) int {
 
 	docker_push(version, is_latest) or { panic(err) }
 
-	println('All done!')
+	println('All done building!')
 	return 0
 }
 
 fn cleanup() !bool {
-	println("Starting clean up...")
+	println('Starting clean up...')
 	bash('docker image prune -af')! // --all --force
 	return true
 }
@@ -165,14 +255,18 @@ fn main_(args []string) int {
 	if args.len == 0 {
 		// build latest
 		is_latest := true
-		latest := get_latest_release()
+		latest := get_latest_gh_release()
 
 		return build_version(latest, is_latest)
 	}
 
-	if args.len == 1 && args[0].int() > 0 {
-		get_latest_releases(args[0].int()).map(build_version(it, false))
-		return 0
+	if args.len == 1 {
+		if args[0].int() > 0 {
+			get_latest_gh_releases(args[0].int()).map(build_version(it, false))
+			return 0
+		} else if args[0] in ['manifest', 'manifests'] {
+			return int(create_missing_manifests())
+		}
 	}
 
 	for arg in args {
@@ -180,16 +274,19 @@ fn main_(args []string) int {
 		return 0
 	}
 
+	// todo: create manifests
+
 	// something went wrong, return exit code 1:
 	return 1
 }
 
 fn main() {
 	/**
-	* You can run this script in 3 ways:
+	* You can run this script in multiple ways:
 	* - `./build.vsh` - build latest release
 	* - `./build.vsh 0.4.6 0.4.7` - build specific release(s)
 	* - `./build.vsh 5` - build the 5 latest releases
+	* - `./build.vsh manifests` - generate missing manifests (-> releases for multiple architectures)
 	*/
 
 	exit(main_(os.args[1..]))
